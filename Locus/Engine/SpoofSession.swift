@@ -276,5 +276,118 @@ final class SpoofSession: ObservableObject {
         String(format: "%.5f, %.5f", coordinate.latitude, coordinate.longitude)
     }
 
-    private static func isGenericFavoriteName(_ name: String) -> Bool {
+        private static func isGenericFavoriteName(_ name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = trimmed.split(separator: ",")
+        guard parts.count == 2,
+              Double(parts[0].trimmingCharacters(in: .whitespaces)) != nil,
+              Double(parts[1].trimmingCharacters(in: .whitespaces)) != nil else {
+            return false
+        }
+        return true
+    }
+
+    private func tickJoystick(pairing: PairingStore) {
+        guard joystickActive else { return }
+        let magnitude = hypot(joystickVector.dx, joystickVector.dy)
+        guard magnitude > 0.05 else { return }
+
+        guard let current = simulated ?? pin ?? locationKeeper.lastKnownCoordinate else { return }
+        let activeBaseSpeed = customSpeedMPH.map { $0 * 0.44704 } ?? travelMode.baseSpeed
+        let speed = max(0.8, activeBaseSpeed * min(1.0, magnitude))
+        let stepMeters = max(1.0, speed * 0.25)
+
+        let heading = atan2(joystickVector.dy, joystickVector.dx)
+        let metersNorth = sin(heading) * stepMeters
+        let metersEast = cos(heading) * stepMeters
+
+        let latDelta = metersNorth / 111_111.0
+        let cosLat = max(0.01, cos(current.latitude * .pi / 180.0))
+        let lonDelta = metersEast / (111_111.0 * cosLat)
+
+        let next = CLLocationCoordinate2D(
+            latitude: current.latitude + latDelta,
+            longitude: current.longitude + lonDelta
+        )
+        apply(next, pairing: pairing, markRecent: false)
+    }
+
+    private func apply(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool) {
+        simulated = coordinate
+        if markRecent {
+            let place = SavedPlace(
+                name: Self.coordinateLabel(coordinate),
+                latitude: coordinate.latitude,
+                longitude: coordinate.longitude
+            )
+            recents.removeAll { $0.id == place.id }
+            recents.insert(place, at: 0)
+            SavedPlace.save(recents, key: recentsKey)
+        }
+        _ = LocationEngine.setLocation(coordinate, pairing: pairing)
+        if status != .active {
+            status = .active
+        }
+        beginBackgroundIfNeeded()
+        startResend(coordinate: coordinate, pairing: pairing)
+        startHealth()
+    }
+
+    private func startResend(coordinate: CLLocationCoordinate2D, pairing: PairingStore) {
+        stopResend()
+        resendTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isSpoofing else { return }
+                _ = LocationEngine.setLocation(coordinate, pairing: pairing)
+            }
+        }
+    }
+
+    private func stopResend() {
+        resendTimer?.invalidate()
+        resendTimer = nil
+    }
+
+    private func startHealth() {
+        stopHealth()
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isSpoofing else { return }
+                if !LocalDevVPN.isConnected {
+                    self.status = .reconnecting
+                } else if self.status == .reconnecting {
+                    self.status = .active
+                }
+            }
+        }
+    }
+
+    private func stopHealth() {
+        healthTimer?.invalidate()
+        healthTimer = nil
+    }
+
+    private func beginBackgroundIfNeeded() {
+        guard backgroundTask == .invalid else { return }
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "LocusSpoof") { [weak self] in
+            Task { @MainActor in
+                self?.endBackground()
+            }
+        }
+    }
+
+    private func endBackground() {
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
+    }
+
+    private func postDropNotification(_ message: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Locus"
+        content.body = message
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+}
