@@ -94,6 +94,8 @@ final class SpoofSession: ObservableObject {
     private let favoritesKey = "locus.favorites"
     private let recentsKey = "locus.recents"
 
+    private static let defaultTunnelIP = "10.7.0.1"
+
     init() {
         favorites = SavedPlace.load(key: favoritesKey)
         recents = SavedPlace.load(key: recentsKey)
@@ -337,14 +339,27 @@ final class SpoofSession: ObservableObject {
             recents.insert(place, at: 0)
             SavedPlace.save(recents, key: recentsKey)
         }
-        // Check your LocationEngine definition if `setLocation` is named differently in your fork.
-        _ = LocationEngine.setLocation(coordinate, pairing: pairing)
-        if status != .active {
-            status = .active
+
+        let result = LocationEngine.set(
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude,
+            pairingPath: pairing.pairingPath,
+            deviceIP: Self.defaultTunnelIP
+        )
+
+        switch result {
+        case .success:
+            if status != .active {
+                status = .active
+            }
+            beginBackgroundIfNeeded()
+            startResend(coordinate: coordinate, pairing: pairing)
+            startHealth()
+        case .failure(let error):
+            lastError = error.localizedDescription
+            status = .dropped(error.localizedDescription)
+            postDropNotification(error.localizedDescription)
         }
-        beginBackgroundIfNeeded()
-        startResend(coordinate: coordinate, pairing: pairing)
-        startHealth()
     }
 
     private func startResend(coordinate: CLLocationCoordinate2D, pairing: PairingStore) {
@@ -352,7 +367,17 @@ final class SpoofSession: ObservableObject {
         resendTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isSpoofing else { return }
-                _ = LocationEngine.setLocation(coordinate, pairing: pairing)
+                let result = LocationEngine.set(
+                    latitude: coordinate.latitude,
+                    longitude: coordinate.longitude,
+                    pairingPath: pairing.pairingPath,
+                    deviceIP: Self.defaultTunnelIP
+                )
+                if case .failure(let error) = result {
+                    self.lastError = error.localizedDescription
+                    self.status = .dropped(error.localizedDescription)
+                    self.postDropNotification(error.localizedDescription)
+                }
             }
         }
     }
