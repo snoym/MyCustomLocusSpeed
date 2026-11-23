@@ -74,6 +74,7 @@ final class SpoofSession: ObservableObject {
     @Published var pin: CLLocationCoordinate2D?
     @Published var simulated: CLLocationCoordinate2D?
     @Published var travelMode: TravelMode = .walk
+    @Published var customSpeedMPH: Double? = nil
     @Published var mapStyleIndex: Int = 0
     @Published var lastError: String?
     @Published var isBusy = false
@@ -195,7 +196,8 @@ final class SpoofSession: ObservableObject {
                 if Task.isCancelled { break }
                 let distance = CLLocation(latitude: previous.latitude, longitude: previous.longitude)
                     .distance(from: CLLocation(latitude: next.latitude, longitude: next.longitude))
-                var speed = mode.baseSpeed * Double.random(in: 0.88...1.12)
+                let activeBaseSpeed = self.customSpeedMPH.map { $0 * 0.44704 } ?? mode.baseSpeed
+                var speed = activeBaseSpeed * Double.random(in: 0.88...1.12)
                 speed = max(0.8, speed)
                 let stepMeters: CLLocationDistance = min(12, max(4, speed * 0.5))
                 let steps = max(1, Int(ceil(distance / stepMeters)))
@@ -276,156 +278,3 @@ final class SpoofSession: ObservableObject {
 
     private static func isGenericFavoriteName(_ name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty || trimmed == "Favorite" { return true }
-        // Coordinate-looking labels from older teleports.
-        let parts = trimmed.split(separator: ",")
-        if parts.count == 2,
-           Double(parts[0].trimmingCharacters(in: .whitespaces)) != nil,
-           Double(parts[1].trimmingCharacters(in: .whitespaces)) != nil {
-            return true
-        }
-        return false
-    }
-
-    private func apply(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool) {
-        if status == .idle || status.isDropped {
-            status = .connecting
-        }
-        isBusy = true
-        let result = LocationEngine.set(
-            latitude: coordinate.latitude,
-            longitude: coordinate.longitude,
-            pairingPath: pairing.pairingPath,
-            deviceIP: TunnelConfig.targetIP
-        )
-        isBusy = false
-        switch result {
-        case .success:
-            simulated = coordinate
-            pin = coordinate
-            status = .active
-            lastError = nil
-            beginBackground()
-            locationKeeper.start()
-            startResend(pairing: pairing)
-            startHealth(pairing: pairing)
-            if markRecent {
-                pushRecent(coordinate)
-            }
-        case .failure(let error):
-            lastError = error.localizedDescription
-            if simulated != nil {
-                status = .dropped(error.localizedDescription)
-                postDropNotification(error.localizedDescription)
-            } else {
-                status = .idle
-            }
-        }
-    }
-
-    private func tickJoystick(pairing: PairingStore) {
-        guard joystickActive, let current = simulated else { return }
-        let magnitude = hypot(joystickVector.dx, joystickVector.dy)
-        guard magnitude > 0.08 else { return }
-        let nx = joystickVector.dx / magnitude
-        let ny = -joystickVector.dy / magnitude
-        let speed = travelMode.baseSpeed * min(1.0, magnitude) * Double.random(in: 0.9...1.1)
-        let dt = 0.25
-        let meters = speed * dt
-        let next = offset(coordinate: current, eastMeters: nx * meters, northMeters: ny * meters)
-        apply(next, pairing: pairing, markRecent: false)
-    }
-
-    private func startResend(pairing: PairingStore) {
-        resendTimer?.invalidate()
-        resendTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, let sim = self.simulated else { return }
-                _ = LocationEngine.set(
-                    latitude: sim.latitude,
-                    longitude: sim.longitude,
-                    pairingPath: pairing.pairingPath,
-                    deviceIP: TunnelConfig.targetIP
-                )
-            }
-        }
-    }
-
-    private func stopResend() {
-        resendTimer?.invalidate()
-        resendTimer = nil
-    }
-
-    private func startHealth(pairing: PairingStore) {
-        healthTimer?.invalidate()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, let sim = self.simulated else { return }
-                if case .dropped = self.status {
-                    self.status = .reconnecting
-                    self.apply(sim, pairing: pairing, markRecent: false)
-                } else if !LocationEngine.isSessionActive, self.isSpoofing {
-                    self.status = .reconnecting
-                    self.apply(sim, pairing: pairing, markRecent: false)
-                }
-            }
-        }
-    }
-
-    private func stopHealth() {
-        healthTimer?.invalidate()
-        healthTimer = nil
-    }
-
-    private func pushRecent(_ coordinate: CLLocationCoordinate2D) {
-        pushNamedRecent(
-            name: Self.coordinateLabel(coordinate),
-            coordinate: coordinate
-        )
-    }
-
-    func pushNamedRecent(name: String, coordinate: CLLocationCoordinate2D) {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let place = SavedPlace(
-            name: trimmed.isEmpty ? Self.coordinateLabel(coordinate) : trimmed,
-            latitude: coordinate.latitude,
-            longitude: coordinate.longitude
-        )
-        recents.removeAll {
-            abs($0.latitude - place.latitude) < 0.00015 && abs($0.longitude - place.longitude) < 0.00015
-        }
-        recents.insert(place, at: 0)
-        if recents.count > 20 { recents = Array(recents.prefix(20)) }
-        SavedPlace.save(recents, key: recentsKey)
-    }
-
-    private func beginBackground() {
-        guard backgroundTask == .invalid else { return }
-        backgroundTask = UIApplication.shared.beginBackgroundTask { [weak self] in
-            self?.endBackground()
-        }
-    }
-
-    private func endBackground() {
-        guard backgroundTask != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(backgroundTask)
-        backgroundTask = .invalid
-    }
-
-    private func postDropNotification(_ message: String) {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        let content = UNMutableNotificationContent()
-        content.title = "Locus spoof dropped"
-        content.body = message
-        content.sound = .default
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
-    }
-
-    private func offset(coordinate: CLLocationCoordinate2D, eastMeters: Double, northMeters: Double) -> CLLocationCoordinate2D {
-        let earth = 6378137.0
-        let dLat = northMeters / earth * (180 / .pi)
-        let dLon = eastMeters / (earth * cos(coordinate.latitude * .pi / 180)) * (180 / .pi)
-        return CLLocationCoordinate2D(latitude: coordinate.latitude + dLat, longitude: coordinate.longitude + dLon)
-    }
-}
