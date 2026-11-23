@@ -155,7 +155,6 @@ struct StatusBarView: View {
     }
 }
 
-
 struct BottomControlsView: View {
     @EnvironmentObject private var session: SpoofSession
     @EnvironmentObject private var pairing: PairingStore
