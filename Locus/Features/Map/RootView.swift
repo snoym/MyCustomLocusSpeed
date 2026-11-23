@@ -161,6 +161,8 @@ struct BottomControlsView: View {
     @Binding var showSettings: Bool
     @Binding var showPlaces: Bool
 
+    @State private var sliderMPH: Double = 15
+
     private let trayShape = RoundedRectangle(cornerRadius: 28, style: .continuous)
 
     var body: some View {
@@ -175,9 +177,11 @@ struct BottomControlsView: View {
 
             HStack(spacing: 8) {
                 ForEach(TravelMode.allCases) { mode in
-                    let selected = session.travelMode == mode
+                    let selected = session.travelMode == mode && session.customSpeedMPH == nil
                     Button {
                         session.travelMode = mode
+                        session.customSpeedMPH = nil
+                        sliderMPH = (mode.baseSpeed / 0.44704).rounded()
                     } label: {
                         Image(systemName: mode.icon)
                             .font(.body.weight(.semibold))
@@ -190,8 +194,22 @@ struct BottomControlsView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                Spacer(minLength: 0)
+
+                Spacer(minLength: 4)
+
+                Text("\(Int(sliderMPH.rounded())) mph")
+                    .font(.caption.monospacedDigit().weight(.bold))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(Color.primary.opacity(0.08)))
             }
+
+            Slider(value: $sliderMPH, in: 1...200, step: 1)
+                .tint(LocusTheme.accent)
+                .onChange(of: sliderMPH) { _, newValue in
+                    session.customSpeedMPH = newValue
+                }
 
             HStack(spacing: 10) {
                 trayIcon("gearshape.fill") { showSettings = true }
@@ -249,45 +267,3 @@ struct BottomControlsView: View {
                             .padding(.vertical, 12)
                             .padding(.horizontal, 10)
                             .background(Capsule().fill(LocusTheme.accent))
-                            .contentShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(session.isBusy)
-                }
-            }
-        }
-        .padding(14)
-        .locusGlass(.regular, in: trayShape)
-        // Whole tray absorbs taps so near-misses don't fall through to the map.
-        .contentShape(trayShape)
-    }
-
-    private func trayIcon(_ systemName: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.body.weight(.semibold))
-                .foregroundStyle(.primary)
-                .frame(width: 44, height: 44)
-                .background(Circle().fill(Color.primary.opacity(0.08)))
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-struct IconButton: View {
-    let systemName: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.body.weight(.semibold))
-                .frame(width: 44, height: 44)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .locusGlass(.interactive, in: Circle())
-        .foregroundStyle(.primary)
-    }
-}
