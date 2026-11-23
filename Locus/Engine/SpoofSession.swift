@@ -250,6 +250,19 @@ final class SpoofSession: ObservableObject {
         SavedPlace.save(favorites, key: favoritesKey)
     }
 
+    func pushNamedRecent(name: String, coordinate: CLLocationCoordinate2D) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let label = trimmed.isEmpty ? Self.coordinateLabel(coordinate) : trimmed
+        let place = SavedPlace(
+            name: label,
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude
+        )
+        recents.removeAll { $0.id == place.id }
+        recents.insert(place, at: 0)
+        SavedPlace.save(recents, key: recentsKey)
+    }
+
     func removeRecent(_ place: SavedPlace) {
         recents.removeAll { $0.id == place.id }
         SavedPlace.save(recents, key: recentsKey)
@@ -276,7 +289,7 @@ final class SpoofSession: ObservableObject {
         String(format: "%.5f, %.5f", coordinate.latitude, coordinate.longitude)
     }
 
-        private static func isGenericFavoriteName(_ name: String) -> Bool {
+    private static func isGenericFavoriteName(_ name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: ",")
         guard parts.count == 2,
@@ -324,6 +337,7 @@ final class SpoofSession: ObservableObject {
             recents.insert(place, at: 0)
             SavedPlace.save(recents, key: recentsKey)
         }
+        // Check your LocationEngine definition if `setLocation` is named differently in your fork.
         _ = LocationEngine.setLocation(coordinate, pairing: pairing)
         if status != .active {
             status = .active
