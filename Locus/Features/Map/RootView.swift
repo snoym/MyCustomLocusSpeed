@@ -203,7 +203,7 @@ struct BottomControlsView: View {
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                TextField("1–200", text: $speedText)
+                TextField("1–500", text: $speedText)
                     .keyboardType(.numberPad)
                     .focused($speedFieldFocused)
                     .multilineTextAlignment(.trailing)
@@ -316,7 +316,7 @@ struct BottomControlsView: View {
             return
         }
 
-        let clamped = min(200, max(1, parsed))
+        let clamped = min(500, max(1, parsed))
         session.customSpeedMPH = clamped
         speedText = "\(Int(clamped.rounded()))"
     }
