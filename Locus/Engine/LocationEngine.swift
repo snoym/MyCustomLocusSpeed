@@ -1,430 +1,174 @@
-import CoreLocation
 import Foundation
-import MapKit
-import UIKit
-import UserNotifications
+import idevice
 
-enum TravelMode: String, CaseIterable, Identifiable {
-    case walk, run, cycle, drive
+enum LocationEngineError: LocalizedError {
+    case invalidIP
+    case pairingRead
+    case tunnelCreate
+    case remoteServer
+    case simulationCreate
+    case locationSet
+    case locationClear
+    case notActive
 
-    var id: String { rawValue }
-
-    var title: String {
+    var errorDescription: String? {
         switch self {
-        case .walk: return "Walk"
-        case .run: return "Run"
-        case .cycle: return "Cycle"
-        case .drive: return "Drive"
+        case .invalidIP: return "Tunnel IP is invalid. Check Settings → Tunnel IP (usually 10.7.0.1)."
+        case .pairingRead: return "Could not read the RPPairing file. Generate one with idevice_pair in RPPairing mode."
+        case .tunnelCreate: return "Could not open the developer tunnel. Is LocalDevVPN connected on Wi‑Fi?"
+        case .remoteServer: return "Connected to the tunnel but RemoteXPC handshake failed."
+        case .simulationCreate: return "Could not open Apple’s location simulation service."
+        case .locationSet: return "Failed to set simulated coordinates."
+        case .locationClear: return "Failed to clear simulated location."
+        case .notActive: return "No active simulation session."
         }
     }
 
-    var icon: String {
-        switch self {
-        case .walk: return "figure.walk"
-        case .run: return "figure.run"
-        case .cycle: return "bicycle"
-        case .drive: return "car.fill"
-        }
-    }
-
-    /// Base meters per second before natural variation.
-    var baseSpeed: CLLocationSpeed {
-        switch self {
-        case .walk: return 6.7
-        case .run: return 15.6
-        case .cycle: return 31.3
-        case .drive: return 71.5
-        }
-    }
-
-    var mkTransportType: MKDirectionsTransportType {
-        switch self {
-        case .walk, .run: return .walking
-        case .cycle, .drive: return .automobile
+    static func from(code: Int32) -> LocationEngineError {
+        switch code {
+        case 1: return .invalidIP
+        case 2: return .pairingRead
+        case 3: return .tunnelCreate
+        case 9: return .remoteServer
+        case 10: return .simulationCreate
+        case 11: return .locationSet
+        case 12: return .locationClear
+        default: return .locationSet
         }
     }
 }
 
-enum SpoofStatus: Equatable {
-    case idle
-    case connecting
-    case active
-    case reconnecting
-    case dropped(String)
+/// Thin Swift wrapper around idevice’s DVT location simulation (injects into locationd).
+enum LocationEngine {
+    private static let queue = DispatchQueue(label: "com.chrismack.locus.location", qos: .userInitiated)
 
-    var label: String {
-        switch self {
-        case .idle: return "Not Spoofing"
-        case .connecting: return "Starting…"
-        case .active: return "Spoofing"
-        case .reconnecting: return "Reconnecting…"
-        case .dropped: return "Interrupted"
+    private static var adapter: OpaquePointer?
+    private static var handshake: OpaquePointer?
+    private static var remoteServer: OpaquePointer?
+    private static var locationSimulation: OpaquePointer?
+
+    private static let ok: Int32 = 0
+    private static let invalidIP: Int32 = 1
+    private static let pairingRead: Int32 = 2
+    private static let tunnelCreate: Int32 = 3
+    private static let remoteServerCode: Int32 = 9
+    private static let simulationCreate: Int32 = 10
+    private static let locationSet: Int32 = 11
+    private static let locationClear: Int32 = 12
+
+    static var isSessionActive: Bool { locationSimulation != nil }
+
+    static func set(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) -> Result<Void, LocationEngineError> {
+        var result: Result<Void, LocationEngineError> = .failure(.locationSet)
+        queue.sync {
+            let code = setLocked(latitude: latitude, longitude: longitude, pairingPath: pairingPath, deviceIP: deviceIP)
+            result = code == ok ? .success(()) : .failure(.from(code: code))
+        }
+        return result
+    }
+
+    static func clear() -> Result<Void, LocationEngineError> {
+        var result: Result<Void, LocationEngineError> = .failure(.notActive)
+        queue.sync {
+            let code = clearLocked()
+            result = code == ok ? .success(()) : .failure(.from(code: code))
+        }
+        return result
+    }
+
+    private static func cleanup() {
+        if let locationSimulation {
+            location_simulation_free(locationSimulation)
+            self.locationSimulation = nil
+        }
+        if let remoteServer {
+            remote_server_free(remoteServer)
+            self.remoteServer = nil
+        }
+        if let handshake {
+            rsd_handshake_free(handshake)
+            self.handshake = nil
+        }
+        if let adapter {
+            adapter_free(adapter)
+            self.adapter = nil
         }
     }
 
-    var isDropped: Bool {
-        if case .dropped = self { return true }
-        return false
-    }
-}
-
-@MainActor
-final class SpoofSession: ObservableObject {
-    @Published var status: SpoofStatus = .idle
-    @Published var pin: CLLocationCoordinate2D?
-    @Published var simulated: CLLocationCoordinate2D?
-    @Published var travelMode: TravelMode = .walk
-    @Published var customSpeedMPH: Double? = nil
-    @Published var mapStyleIndex: Int = 0
-    @Published var lastError: String?
-    @Published var isBusy = false
-    @Published var joystickActive = false
-
-    @Published var favorites: [SavedPlace] = []
-    @Published var recents: [SavedPlace] = []
-
-    private var resendTimer: Timer?
-    private var healthTimer: Timer?
-    private var joystickTimer: Timer?
-    private var routeTask: Task<Void, Never>?
-    private var backgroundTask = UIBackgroundTaskIdentifier.invalid
-    private var joystickVector: CGVector = .zero
-    private let locationKeeper = BackgroundKeepAlive()
-
-    private let favoritesKey = "locus.favorites"
-    private let recentsKey = "locus.recents"
-
-    init() {
-        favorites = SavedPlace.load(key: favoritesKey)
-        recents = SavedPlace.load(key: recentsKey)
-    }
-
-    var isSpoofing: Bool {
-        if case .active = status { return true }
-        if case .reconnecting = status { return true }
-        return false
-    }
-
-    func teleport(to coordinate: CLLocationCoordinate2D, pairing: PairingStore) {
-        guard pairing.hasPairingFile else {
-            lastError = "Import an RPPairing file in Settings first."
-            return
-        }
-        pin = coordinate
-        apply(coordinate, pairing: pairing, markRecent: true)
-    }
-
-    func stop(pairing: PairingStore) {
-        routeTask?.cancel()
-        routeTask = nil
-        stopJoystick()
-        stopResend()
-        stopHealth()
-        isBusy = true
-        let result = LocationEngine.clear()
-        isBusy = false
-        switch result {
-        case .success:
-            simulated = nil
-            status = .idle
-            endBackground()
-            // Keep location updates running so the map puck / locate button
-            // can return to the real GPS fix (not the leftover pin).
-            locationKeeper.start()
-        case .failure(let error):
-            lastError = error.localizedDescription
-            status = .dropped(error.localizedDescription)
-            postDropNotification(error.localizedDescription)
-        }
-    }
-
-    /// Best-known real device coordinate (not the teleport pin).
-    var realCoordinate: CLLocationCoordinate2D? {
-        locationKeeper.lastKnownCoordinate
-    }
-
-    /// Start lightweight GPS updates for the map puck / locate button.
-    func startLocationUpdates() {
-        locationKeeper.start()
-    }
-
-    func startJoystick(pairing: PairingStore) {
-        guard pairing.hasPairingFile else {
-            lastError = "Import an RPPairing file in Settings first."
-            return
-        }
-        let start = simulated ?? pin ?? locationKeeper.lastKnownCoordinate
-        guard let start else {
-            lastError = "Drop a pin or teleport somewhere before using the joystick."
-            return
-        }
-        if simulated == nil {
-            apply(start, pairing: pairing, markRecent: false)
-        }
-        joystickActive = true
-        joystickTimer?.invalidate()
-        joystickTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.tickJoystick(pairing: pairing)
+    private static func setLocked(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) -> Int32 {
+        if let locationSimulation {
+            if let err = location_simulation_set(locationSimulation, latitude, longitude) {
+                idevice_error_free(err)
+                cleanup()
+            } else {
+                return ok
             }
         }
-    }
 
-    func updateJoystick(vector: CGVector) {
-        joystickVector = vector
-    }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(49152).bigEndian
+        let inetResult = deviceIP.withCString { inet_pton(AF_INET, $0, &address.sin_addr) }
+        guard inetResult == 1 else { return invalidIP }
 
-    func stopJoystick() {
-        joystickActive = false
-        joystickVector = .zero
-        joystickTimer?.invalidate()
-        joystickTimer = nil
-    }
-
-    func followRoute(_ coordinates: [CLLocationCoordinate2D], pairing: PairingStore) {
-        guard pairing.hasPairingFile, coordinates.count >= 2 else { return }
-        routeTask?.cancel()
-        stopJoystick()
-        let mode = travelMode
-        routeTask = Task { [weak self] in
-            guard let self else { return }
-            var previous = coordinates[0]
-            await MainActor.run {
-                self.apply(previous, pairing: pairing, markRecent: true)
-            }
-            for next in coordinates.dropFirst() {
-                if Task.isCancelled { break }
-                let distance = CLLocation(latitude: previous.latitude, longitude: previous.longitude)
-                    .distance(from: CLLocation(latitude: next.latitude, longitude: next.longitude))
-                let activeBaseSpeed = self.customSpeedMPH.map { $0 * 0.44704 } ?? mode.baseSpeed
-                var speed = activeBaseSpeed * Double.random(in: 0.88...1.12)
-                speed = max(0.8, speed)
-                let stepMeters: CLLocationDistance = min(12, max(4, speed * 0.5))
-                let steps = max(1, Int(ceil(distance / stepMeters)))
-                for i in 1...steps {
-                    if Task.isCancelled { break }
-                    let t = Double(i) / Double(steps)
-                    let coord = CLLocationCoordinate2D(
-                        latitude: previous.latitude + (next.latitude - previous.latitude) * t,
-                        longitude: previous.longitude + (next.longitude - previous.longitude) * t
-                    )
-                    let delay = stepMeters / speed
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                    await MainActor.run {
-                        self.apply(coord, pairing: pairing, markRecent: false)
-                    }
-                }
-                previous = next
-            }
+        var pairingHandle: OpaquePointer?
+        if let pairingError = pairingPath.withCString({ rp_pairing_file_read($0, &pairingHandle) }) {
+            idevice_error_free(pairingError)
+            return pairingRead
         }
-    }
+        guard let pairingHandle else { return pairingRead }
+        defer { rp_pairing_file_free(pairingHandle) }
 
-    func addFavorite(name: String, coordinate: CLLocationCoordinate2D) {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let place = SavedPlace(
-            name: trimmed.isEmpty ? Self.coordinateLabel(coordinate) : trimmed,
-            latitude: coordinate.latitude,
-            longitude: coordinate.longitude
-        )
-        // Don't let a generic star overwrite a named favorite for the same spot.
-        if let existing = favorites.first(where: { $0.id == place.id }),
-           Self.isGenericFavoriteName(place.name),
-           !Self.isGenericFavoriteName(existing.name) {
-            return
-        }
-        favorites.removeAll { $0.id == place.id }
-        favorites.insert(place, at: 0)
-        SavedPlace.save(favorites, key: favoritesKey)
-    }
-
-    func renameFavorite(_ place: SavedPlace, to name: String) {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              let index = favorites.firstIndex(where: { $0.id == place.id }) else { return }
-        favorites[index].name = trimmed
-        SavedPlace.save(favorites, key: favoritesKey)
-    }
-
-    func removeFavorite(_ place: SavedPlace) {
-        favorites.removeAll { $0.id == place.id }
-        SavedPlace.save(favorites, key: favoritesKey)
-    }
-
-    func pushNamedRecent(name: String, coordinate: CLLocationCoordinate2D) {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let label = trimmed.isEmpty ? Self.coordinateLabel(coordinate) : trimmed
-        let place = SavedPlace(
-            name: label,
-            latitude: coordinate.latitude,
-            longitude: coordinate.longitude
-        )
-        recents.removeAll { $0.id == place.id }
-        recents.insert(place, at: 0)
-        SavedPlace.save(recents, key: recentsKey)
-    }
-
-    func removeRecent(_ place: SavedPlace) {
-        recents.removeAll { $0.id == place.id }
-        SavedPlace.save(recents, key: recentsKey)
-    }
-
-    /// Best display name for starring the current pin (search title, matching recent, etc.).
-    func suggestedFavoriteName(for coordinate: CLLocationCoordinate2D, fallback: String? = nil) -> String {
-        if let fallback, !fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return fallback.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if let favorite = favorites.first(where: { $0.id == SavedPlace(name: "", latitude: coordinate.latitude, longitude: coordinate.longitude).id }),
-           !Self.isGenericFavoriteName(favorite.name) {
-            return favorite.name
-        }
-        if let recent = recents.first(where: {
-            abs($0.latitude - coordinate.latitude) < 0.00015 && abs($0.longitude - coordinate.longitude) < 0.00015
-        }), !Self.isGenericFavoriteName(recent.name) {
-            return recent.name
-        }
-        return Self.coordinateLabel(coordinate)
-    }
-
-    private static func coordinateLabel(_ coordinate: CLLocationCoordinate2D) -> String {
-        String(format: "%.5f, %.5f", coordinate.latitude, coordinate.longitude)
-    }
-
-    private static func isGenericFavoriteName(_ name: String) -> Bool {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parts = trimmed.split(separator: ",")
-        guard parts.count == 2,
-              Double(parts[0].trimmingCharacters(in: .whitespaces)) != nil,
-              Double(parts[1].trimmingCharacters(in: .whitespaces)) != nil else {
-            return false
-        }
-        return true
-    }
-
-    private func tickJoystick(pairing: PairingStore) {
-        guard joystickActive else { return }
-        let magnitude = hypot(joystickVector.dx, joystickVector.dy)
-        guard magnitude > 0.05 else { return }
-
-        guard let current = simulated ?? pin ?? locationKeeper.lastKnownCoordinate else { return }
-        let activeBaseSpeed = customSpeedMPH.map { $0 * 0.44704 } ?? travelMode.baseSpeed
-        let speed = max(0.8, activeBaseSpeed * min(1.0, magnitude))
-        let stepMeters = max(1.0, speed * 0.25)
-
-        let heading = atan2(joystickVector.dy, joystickVector.dx)
-        let metersNorth = sin(heading) * stepMeters
-        let metersEast = cos(heading) * stepMeters
-
-        let latDelta = metersNorth / 111_111.0
-        let cosLat = max(0.01, cos(current.latitude * .pi / 180.0))
-        let lonDelta = metersEast / (111_111.0 * cosLat)
-
-        let next = CLLocationCoordinate2D(
-            latitude: current.latitude + latDelta,
-            longitude: current.longitude + lonDelta
-        )
-        apply(next, pairing: pairing, markRecent: false)
-    }
-
-    private func apply(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool) {
-        simulated = coordinate
-        if markRecent {
-            let place = SavedPlace(
-                name: Self.coordinateLabel(coordinate),
-                latitude: coordinate.latitude,
-                longitude: coordinate.longitude
-            )
-            recents.removeAll { $0.id == place.id }
-            recents.insert(place, at: 0)
-            SavedPlace.save(recents, key: recentsKey)
-        }
-
-        let result = LocationEngine.set(
-            latitude: coordinate.latitude,
-            longitude: coordinate.longitude,
-            pairingPath: pairing.pairingPath,
-            deviceIP: pairing.deviceIP
-        )
-
-        switch result {
-        case .success:
-            if status != .active {
-                status = .active
-            }
-            beginBackgroundIfNeeded()
-            startResend(coordinate: coordinate, pairing: pairing)
-            startHealth()
-        case .failure(let error):
-            lastError = error.localizedDescription
-            status = .dropped(error.localizedDescription)
-            postDropNotification(error.localizedDescription)
-        }
-    }
-
-    private func startResend(coordinate: CLLocationCoordinate2D, pairing: PairingStore) {
-        stopResend()
-        resendTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.isSpoofing else { return }
-                let result = LocationEngine.set(
-                    latitude: coordinate.latitude,
-                    longitude: coordinate.longitude,
-                    pairingPath: pairing.pairingPath,
-                    deviceIP: pairing.deviceIP
+        let providerError = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                tunnel_create_rppairing(
+                    $0,
+                    socklen_t(MemoryLayout<sockaddr_in>.stride),
+                    "LocusLocation",
+                    pairingHandle,
+                    nil,
+                    nil,
+                    &adapter,
+                    &handshake
                 )
-                if case .failure(let error) = result {
-                    self.lastError = error.localizedDescription
-                    self.status = .dropped(error.localizedDescription)
-                    self.postDropNotification(error.localizedDescription)
-                }
             }
         }
-    }
-
-    private func stopResend() {
-        resendTimer?.invalidate()
-        resendTimer = nil
-    }
-
-    private func startHealth() {
-        stopHealth()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.isSpoofing else { return }
-                if !LocalDevVPN.isConnected {
-                    self.status = .reconnecting
-                } else if self.status == .reconnecting {
-                    self.status = .active
-                }
-            }
+        if let providerError {
+            idevice_error_free(providerError)
+            cleanup()
+            return tunnelCreate
         }
-    }
 
-    private func stopHealth() {
-        healthTimer?.invalidate()
-        healthTimer = nil
-    }
-
-    private func beginBackgroundIfNeeded() {
-        guard backgroundTask == .invalid else { return }
-        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "LocusSpoof") { [weak self] in
-            Task { @MainActor in
-                self?.endBackground()
-            }
+        if let remoteServerError = remote_server_connect_rsd(adapter, handshake, &remoteServer) {
+            idevice_error_free(remoteServerError)
+            cleanup()
+            return remoteServerCode
         }
+
+        if let simError = location_simulation_new(remoteServer, &locationSimulation) {
+            idevice_error_free(simError)
+            cleanup()
+            return simulationCreate
+        }
+        // location_simulation_new consumes/owns remote server lifecycle alongside handle
+        remoteServer = nil
+
+        if let setError = location_simulation_set(locationSimulation, latitude, longitude) {
+            idevice_error_free(setError)
+            cleanup()
+            return locationSet
+        }
+        return ok
     }
 
-    private func endBackground() {
-        guard backgroundTask != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(backgroundTask)
-        backgroundTask = .invalid
-    }
-
-    private func postDropNotification(_ message: String) {
-        let content = UNMutableNotificationContent()
-        content.title = "Locus"
-        content.body = message
-        content.sound = .default
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+    private static func clearLocked() -> Int32 {
+        guard let locationSimulation else { return locationClear }
+        let err = location_simulation_clear(locationSimulation)
+        cleanup()
+        if let err {
+            idevice_error_free(err)
+            return locationClear
+        }
+        return ok
     }
 }
