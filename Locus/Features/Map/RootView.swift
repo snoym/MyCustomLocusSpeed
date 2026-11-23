@@ -155,13 +155,15 @@ struct StatusBarView: View {
     }
 }
 
+
 struct BottomControlsView: View {
     @EnvironmentObject private var session: SpoofSession
     @EnvironmentObject private var pairing: PairingStore
     @Binding var showSettings: Bool
     @Binding var showPlaces: Bool
 
-    @State private var sliderMPH: Double = 15
+    @State private var speedText: String = "15"
+    @FocusState private var speedFieldFocused: Bool
 
     private let trayShape = RoundedRectangle(cornerRadius: 28, style: .continuous)
 
@@ -181,7 +183,8 @@ struct BottomControlsView: View {
                     Button {
                         session.travelMode = mode
                         session.customSpeedMPH = nil
-                        sliderMPH = (mode.baseSpeed / 0.44704).rounded()
+                        speedText = "\(Int((mode.baseSpeed / 0.44704).rounded()))"
+                        speedFieldFocused = false
                     } label: {
                         Image(systemName: mode.icon)
                             .font(.body.weight(.semibold))
@@ -194,22 +197,47 @@ struct BottomControlsView: View {
                     }
                     .buttonStyle(.plain)
                 }
-
-                Spacer(minLength: 4)
-
-                Text("\(Int(sliderMPH.rounded())) mph")
-                    .font(.caption.monospacedDigit().weight(.bold))
-                    .foregroundStyle(.primary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(Color.primary.opacity(0.08)))
             }
 
-            Slider(value: $sliderMPH, in: 1...200, step: 1)
-                .tint(LocusTheme.accent)
-                .onChange(of: sliderMPH) { _, newValue in
-                    session.customSpeedMPH = newValue
+            HStack(spacing: 8) {
+                Text("Speed")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                TextField("1–200", text: $speedText)
+                    .keyboardType(.numberPad)
+                    .focused($speedFieldFocused)
+                    .multilineTextAlignment(.trailing)
+                    .font(.subheadline.monospacedDigit().weight(.bold))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .frame(width: 76)
+                    .background(Capsule().fill(Color.primary.opacity(0.08)))
+                    .onSubmit {
+                        applyTypedSpeed()
+                    }
+                    .onChange(of: speedFieldFocused) { _, isFocused in
+                        if !isFocused {
+                            applyTypedSpeed()
+                        }
+                    }
+
+                Text("mph")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                if speedFieldFocused {
+                    Button("Done") {
+                        applyTypedSpeed()
+                        speedFieldFocused = false
+                    }
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(LocusTheme.accent)
                 }
+            }
 
             HStack(spacing: 10) {
                 trayIcon("gearshape.fill") { showSettings = true }
@@ -267,3 +295,42 @@ struct BottomControlsView: View {
                             .padding(.vertical, 12)
                             .padding(.horizontal, 10)
                             .background(Capsule().fill(LocusTheme.accent))
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(14)
+        .locusGlass(.regular, in: trayShape)
+        .clipShape(trayShape)
+    }
+
+    private func applyTypedSpeed() {
+        let filtered = speedText.filter(\.isNumber)
+        guard let parsed = Double(filtered) else {
+            if let currentCustom = session.customSpeedMPH {
+                speedText = "\(Int(currentCustom.rounded()))"
+            } else {
+                speedText = "\(Int((session.travelMode.baseSpeed / 0.44704).rounded()))"
+            }
+            return
+        }
+
+        let clamped = min(200, max(1, parsed))
+        session.customSpeedMPH = clamped
+        speedText = "\(Int(clamped.rounded()))"
+    }
+
+    private func trayIcon(_ systemName: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.body.weight(.semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 44, height: 40)
+                .background(Capsule().fill(Color.primary.opacity(0.08)))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
