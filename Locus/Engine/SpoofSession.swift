@@ -30,10 +30,10 @@ enum TravelMode: String, CaseIterable, Identifiable {
     /// Base meters per second before natural variation.
     var baseSpeed: CLLocationSpeed {
         switch self {
-        case .walk: return 1.4
-        case .run: return 3.3
-        case .cycle: return 6.5
-        case .drive: return 13.4
+        case .walk: return 6.7
+        case .run: return 15.6
+        case .cycle: return 31.3
+        case .drive: return 71.5
         }
     }
 
